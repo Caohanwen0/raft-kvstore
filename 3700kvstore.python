@@ -2,13 +2,30 @@
 
 import argparse, socket, time, json, select, struct, sys, math, os
 
+#####################
+
 BROADCAST = "FFFF"
+# fields
+SRC = "src"
+DST = "dst"
+LEADER = "leader"
+TYPE = "type"
+MID = "MID"
+KEY = "key"
+VALUE = "value"
+
+TERMINATOR = b'}\n'
+
+#####################
 
 class Replica:
     def __init__(self, port, id, others):
         self.port = port
         self.id = id
         self.others = others
+        self.majority_cnt = ((len(self.others) + 1) // 2) + 1
+        self.buffer = b""
+
 
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.socket.bind(('localhost', 0))
@@ -18,15 +35,47 @@ class Replica:
         self.send(hello)
         print("Sent hello message: %s" % hello, flush=True)
 
+
     def send(self, message):
-        self.socket.sendto(json.dumps(message).encode('utf-8'), ('localhost', self.port))
+        self.socket.sendto(json.dumps(message).encode('utf-8') + b'\n', ('localhost', self.port))
+        print("Replica %d send message %s." % self.id, json.dumps(message, indent=2), flush = True)
+
+
+    def get_msg(self, dst, leader, type, mid)->dict:
+        return {
+            SRC : self.id,
+            DST : dst,
+            LEADER : leader,
+            TYPE : type,
+            MID : mid
+        }
+
+        
+
+    def receive(self):
+        data = self.socket.recv(65535)
+        if (len(data) == 0):
+            return None
+
+        self.buffer += data
+        msgs = [] # list of dict
+        while TERMINATOR in self.buffer:
+            position = self.buffer.find(TERMINATOR) + len(TERMINATOR)
+            msg_js = json.loads(self.buffer[:position - 1].decode())
+            msgs.append(msg_js)
+            buffer = buffer[position:]
+        return msgs
+
+
 
     def run(self):
         while True:
-            data, addr = self.socket.recvfrom(65535)
-            msg = data.decode('utf-8')
+            connections = select.select([self.socket], [], [], 0.01)[0]
+            if self.socket in connections:
+                msgs = self.receive()
 
-            print("Received message '%s'" % (msg,), flush=True)
+
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='run a key-value store')
