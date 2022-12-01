@@ -13,8 +13,13 @@ TYPE = "type"
 MID = "MID"
 KEY = "key"
 VALUE = "value"
+TERM = "term"
 
 TERMINATOR = b'}\n'
+
+FOLLOWER = "follower"
+CANDIDATE = "candidate"
+CLIENT = "client"
 
 #####################
 
@@ -25,7 +30,20 @@ class Replica:
         self.others = others
         self.majority_cnt = ((len(self.others) + 1) // 2) + 1
         self.buffer = b""
+        self.leader_id = None # currently believed leader id
+        self.identity = FOLLOWER
 
+        self.database = {}
+
+        self.next_idx = {}
+        self.match_idx = {} # volatile state on all leaders
+
+        self.term = 0
+
+        self.log = [{'term': 0}, ] # transaction log
+
+        self.commit_idx = 0
+        self.last_applied = 0
 
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.socket.bind(('localhost', 0))
@@ -36,21 +54,11 @@ class Replica:
         print("Sent hello message: %s" % hello, flush=True)
 
 
+
     def send(self, message):
         self.socket.sendto(json.dumps(message).encode('utf-8') + b'\n', ('localhost', self.port))
         print("Replica %d send message %s." % self.id, json.dumps(message, indent=2), flush = True)
 
-
-    def get_msg(self, dst, leader, type, mid)->dict:
-        return {
-            SRC : self.id,
-            DST : dst,
-            LEADER : leader,
-            TYPE : type,
-            MID : mid
-        }
-
-        
 
     def receive(self):
         data = self.socket.recv(65535)
@@ -66,6 +74,100 @@ class Replica:
             buffer = buffer[position:]
         return msgs
 
+    def recv_get(self, msg):
+        response = None
+        if self.identity == LEADER:
+            response = {
+                SRC : self.id,
+                DST : msg[SRC],
+                LEADER : msg[LEADER],
+                TYPE : "ok",
+                MID : msg[MID]
+            }
+            # add value attribute
+            if msg[KEY] in self.database: 
+                # if this data has been put into database before
+                response[VALUE] = self.database[msg[KEY]]
+            else:
+                response[VALUE] = "" 
+            self.send(response) # send message 
+        else:
+            # if not the leader , then redirect this message to leader
+            response = {
+                SRC : self.id,
+                DST : msg[SRC],
+                LEADER : self.leader_id,
+                TYPE : "redirect",
+                MID : msg[MID]
+            }
+            self.send(response)
+
+    def send_append_entry(self, dst_ids, required:bool):
+        if self.identity != LEADER :
+            return
+        for dst_id in dst_ids:
+            next_idx = self.next_idx[dst_id]
+            prev_idx = next_idx - 1
+            prev_log = self.log[prev_idx][TERM]
+            entries = self.log[next_idx:]
+            msg = {
+                SRC : self.id,
+                DST : dst_id,
+                TYPE : "append_entry",
+                TERM : self.term,
+                LEADER : self.leader_id
+            }
+
+    def apply(self):
+        while self.last_applied < self.commit_idx:
+            self.last_applied += 1 # update applied
+            key = self.log[self.last_applied][KEY]
+            value = self.log[self.last_applied][VALUE]
+            # update databse
+            self.database[key] = value
+
+            if self.identity == LEADER:
+                client = self.log[self.last_applied][CLIENT]
+                mid = self.log[self.last_applied][MID]
+                self.send({
+                    SRC : self.id,
+                    DST : client,
+                    LEADER : self.leader_id,
+                    TYPE: "ok",
+                    MID : mid
+                })
+    
+
+    def recv_put(self, msg):
+        if self.identity == LEADER:
+            self.log.append({
+                TERM : self.current_term,
+                KEY : msg[KEY],
+                VALUE : msg[VALUE],
+                CLIENT: msg[SRC],
+                MID : msg[MID]
+            })
+            self.send_append_entry(self.others, False)
+        else:
+            # if not the leader , then redirect this message to leader
+            response = {
+                SRC : self.id,
+                DST : msg[SRC],
+                LEADER : self.leader_id,
+                TYPE : "redirect",
+                MID : msg[MID]
+            }
+            self.send(response)
+
+
+    def handler(self, msg):
+        print('Replica %s received %s\n' % (self.id,json.dumps(msg, indent=2)))
+        type = msg[TYPE]
+        if type == "get":
+            self.recv_get(msg)
+        elif type == "put":
+            self.recv_put(msg)
+        # todo....
 
 
     def run(self):
@@ -73,6 +175,9 @@ class Replica:
             connections = select.select([self.socket], [], [], 0.01)[0]
             if self.socket in connections:
                 msgs = self.receive()
+            for msg in msgs:
+                self.handler(msg)
+
 
 
 
