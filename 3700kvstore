@@ -80,54 +80,8 @@ class Replica:
 
     def send(self, message):
         self.socket.sendto(json.dumps(message).encode(ENCODING), ('localhost', self.port))
-
-    def run(self):
-        self.last_heartbeat = time.time()
-        self.last_append = time.time()
-        self.flush_time = time.time()
-        while True:
-            try:
-                current_time = time.time()
-                data, addr = self.socket.recvfrom(65535)
-                msg = data.decode(ENCODING)
-                print("Received message '%s'" % (msg,), flush=True)
-            except BlockingIOError:
-                # if not receving heartbeat from the leader
-                if current_time - self.last_append >= self.timeout and self.state != LEADER:
-                    # then start election
-                    self.elect_leader()
-                    self.last_append = time.time()
-        
-                if self.state == LEADER and current_time - self.last_heartbeat >= HEARTBEAT:
-                    self.send_append_entries(self.others)
-                    self.last_heartbeat = time.time()
-                continue
-            
-            msg = json.loads(msg)
-            self.handler(msg)
-
-    # entry for message handling
-    def handler(self, msg):
-        type = msg[TYPE]
-        if type == 'get':
-            self.get(msg)
-        elif type == 'put':
-            self.put(msg)
-        elif type == 'request_vote':
-            self.request_vote(msg)
-        elif type == 'append_entries':
-            self.append_entries(msg)
-        elif type == 'grant_append':
-            self.grant_append(msg)
-        elif type == 'reject_append':
-            self.reject_append(msg)
-        elif type == 'grant_vote':
-            self.grant(msg)
-        elif type == 'reject_vote':
-            self.reject_vote(msg)
-
-
-    def get(self, msg):
+      
+    def recv_get(self, msg):
         if self.state == LEADER:
             key = msg[KEY]
             response = self.client_msg(msg[SRC], 'ok', msg[MID])
@@ -147,8 +101,8 @@ class Replica:
 
         self.send(response)
 
-    # put request
-    def put(self, msg):
+    # handle put request
+    def recv_put(self, msg):
         if self.state == LEADER and msg != '':
             if msg[MID] in self.messages_timer and time.time() - self.messages_timer[msg[MID]] > 1:
                 response = {
@@ -197,6 +151,14 @@ class Replica:
             TYPE: type,
             MID: mid
         }
+
+    # get reject message
+    def reject_vote(self, msg): 
+        if self.state == CANDIDATE and msg[TERM] >= self.term:
+            self.term = msg[TERM]
+            self.state = FOLLOWER
+            self.votes = []
+            self.vote = None
 
     # new leader election
     def elect_leader(self):
@@ -259,7 +221,7 @@ class Replica:
         }
 
     # grant the voting request
-    def grant(self, msg):
+    def grant_vote(self, msg):
         if self.state != CANDIDATE:
             return
 
@@ -276,16 +238,7 @@ class Replica:
                 for other in self.others:# update logs
                     self.next_indexes[other] = len(self.log)
                     self.match_indexes[other] = 0
-
-    # get reject message
-    def reject_vote(self, msg): 
-        if self.state == CANDIDATE and msg[TERM] >= self.term:
-            self.term = msg[TERM]
-            self.state = FOLLOWER
-            self.votes = []
-            self.vote = None
             
-
     # grant the append entries rpc
     def grant_append(self, msg):
         if self.state != LEADER:
@@ -431,6 +384,51 @@ class Replica:
             }
 
             self.send(msg)
+
+    # entry for message handling
+    def handler(self, msg):
+        type = msg[TYPE]
+        if type == 'get':
+            self.recv_get(msg)
+        elif type == 'put':
+            self.recv_put(msg)
+        elif type == 'request_vote':
+            self.request_vote(msg)
+        elif type == 'append_entries':
+            self.append_entries(msg)
+        elif type == 'grant_append':
+            self.grant_append(msg)
+        elif type == 'reject_append':
+            self.reject_append(msg)
+        elif type == 'grant_vote':
+            self.grant_vote(msg)
+        elif type == 'reject_vote':
+            self.reject_vote(msg)
+    
+    def run(self):
+        self.last_heartbeat = time.time()
+        self.last_append = time.time()
+        self.flush_time = time.time()
+        while True:
+            try:
+                current_time = time.time()
+                data, addr = self.socket.recvfrom(65535)
+                msg = data.decode(ENCODING)
+                print("Received message '%s'" % (msg,), flush=True)
+            except BlockingIOError:
+                # if not receving heartbeat from the leader
+                if current_time - self.last_append >= self.timeout and self.state != LEADER:
+                    # then start election
+                    self.elect_leader()
+                    self.last_append = time.time()
+        
+                if self.state == LEADER and current_time - self.last_heartbeat >= HEARTBEAT:
+                    self.send_append_entries(self.others)
+                    self.last_heartbeat = time.time()
+                continue
+            
+            msg = json.loads(msg)
+            self.handler(msg)
 
 
 if __name__ == "__main__":
