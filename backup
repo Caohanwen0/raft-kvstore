@@ -46,7 +46,7 @@ class Replica:
         self.others = others
         self.majority_cnt = ((len(self.others) + 1) // 2) + 1
         self.buffer = b""
-        self.leader_id = "0000" # currently believed leader id
+        self.leader_id = BROADCAST # currently believed leader id
         self.identity = FOLLOWER
 
         self.last_heartbeat = time.time()
