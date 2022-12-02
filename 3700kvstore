@@ -5,11 +5,30 @@ import argparse, socket, time, json, select, struct, sys, math, os, random
 
 #################
 
-BROADCAST = "FFFF"
+BROADCAST = 'FFFF'
+ENCODING = 'utf-8'
 
-LEADER = "leader"
+LEADER = 'leader'
 CANDIDATE = 'candidate'
 FOLLOWER = 'follower'
+
+# fields
+SRC = 'src'
+DST = 'dst'
+ENTRIES = 'entries'
+KEY = 'key'
+VALUE = 'value'
+TERM = "term"
+TYPE = "type"
+COMMIT = "commit"
+CLIENT = 'client'
+MID = 'MID'
+PREV_LOG_IDX = "prev_log_idx"
+PREV_LOG_TERM = "prev_log_term"
+NEXT_IDX = "next_idx"
+LAST_LOG_IDX = "last_log_idx" #  = len(log) - 1
+LAST_LOG_TERM = "last_log_term" # = log[-1]
+CANDIDATE_ID = 'candidate_id'
 
 # hyperparameters
 
@@ -29,7 +48,7 @@ class Replica:
         #current term the server is on
         self.term = 0
         self.state = FOLLOWER
-        self.log = [{'term': 0}]
+        self.log = [{TERM: 0}]
 
         # who the current server has voted for
         self.vote = None
@@ -48,15 +67,19 @@ class Replica:
         self.last_append = time.time()
         self.messages_timer = {}
         
-        self.no_leader_queue = []
+        self.no_leader_queue = [] # queue for message caching when there's no leader
 
         print("Replica %s starting up" % self.id, flush=True)
-        hello = { "src": self.id, "dst": BROADCAST, "leader": BROADCAST, "type": "hello" }
+        hello = { SRC: self.id, 
+            DST: BROADCAST, 
+            LEADER: BROADCAST, 
+            TYPE: "hello" 
+        }
         self.send(hello)
         print("Sent hello message: %s" % hello, flush=True)
 
     def send(self, message):
-        self.socket.sendto(json.dumps(message).encode('utf-8'), ('localhost', self.port))
+        self.socket.sendto(json.dumps(message).encode(ENCODING), ('localhost', self.port))
 
     def run(self):
         self.last_heartbeat = time.time()
@@ -66,12 +89,12 @@ class Replica:
             try:
                 current_time = time.time()
                 data, addr = self.socket.recvfrom(65535)
-                msg = data.decode('utf-8')
+                msg = data.decode(ENCODING)
                 print("Received message '%s'" % (msg,), flush=True)
             except BlockingIOError:
                 # if not receving heartbeat from the leader
                 if current_time - self.last_append >= self.timeout and self.state != LEADER:
-                    # then start election!
+                    # then start election
                     self.elect_leader()
                     self.last_append = time.time()
         
@@ -79,13 +102,13 @@ class Replica:
                     self.send_append_entries(self.others)
                     self.last_heartbeat = time.time()
                 continue
-
+            
             msg = json.loads(msg)
             self.handler(msg)
 
-    # handle the messages received
+    # entry for message handling
     def handler(self, msg):
-        type = msg['type']
+        type = msg[TYPE]
         if type == 'get':
             self.get(msg)
         elif type == 'put':
@@ -101,22 +124,22 @@ class Replica:
         elif type == 'grant_vote':
             self.grant(msg)
         elif type == 'reject_vote':
-            self.reject(msg)
+            self.reject_vote(msg)
 
 
     def get(self, msg):
         if self.state == LEADER:
-            key = msg['key']
-            response = self.client_msg(msg['src'], 'ok', msg['MID'])
+            key = msg[KEY]
+            response = self.client_msg(msg[SRC], 'ok', msg[MID])
 
             # if the key is in its store, go and grab the value
             if key in self.database:
-                response['value'] = self.database[key]
+                response[VALUE] = self.database[key]
             else:
-                response['value'] = ''
+                response[VALUE] = ''
         # if self is not the leader, redirect to the leader
         elif self.leader != BROADCAST:
-            response = self.client_msg(msg['src'], 'redirect', msg['MID'])
+            response = self.client_msg(msg[SRC], 'redirect', msg[MID])
 
         # append the message to the queue if there is no leader now
         elif self.leader == BROADCAST:
@@ -124,31 +147,30 @@ class Replica:
 
         self.send(response)
 
-    # handle put request
+    # put request
     def put(self, msg):
         if self.state == LEADER and msg != '':
-            if msg['MID'] in self.messages_timer and time.time() - self.messages_timer[msg['MID']] > 1:
+            if msg[MID] in self.messages_timer and time.time() - self.messages_timer[msg[MID]] > 1:
                 response = {
-                    'src': self.id,
-                    'dst': msg['src'],
-                    'leader': BROADCAST,
-                    'type': 'fail',
-                    'MID': msg['MID']
+                    SRC: self.id,
+                    DST: msg[SRC],
+                    LEADER: BROADCAST,
+                    TYPE: 'fail',
+                    MID: msg[MID]
                 }
 
-                # send fail to the leader
                 self.send(response)
-                del self.messages_timer[msg['MID']]
+                del self.messages_timer[msg[MID]]
 
-            elif msg['MID'] not in self.messages_timer:
-                self.messages_timer[msg['MID']] = time.time()
+            elif msg[MID] not in self.messages_timer:
+                self.messages_timer[msg[MID]] = time.time()
 
             self.log.append(
-                {'term': self.term,
-                 'key': msg['key'],
-                 'value': msg['value'],
-                 'client': msg['src'],
-                 'MID': msg['MID']})
+                {TERM: self.term,
+                 KEY: msg[KEY],
+                 VALUE: msg[VALUE],
+                 CLIENT: msg[SRC],
+                 MID: msg[MID]})
             if self.flush_time - time.time() >= 0.01:
                 self.send_append_entries(self.others)
                 self.flush_time = time.time()
@@ -163,20 +185,20 @@ class Replica:
             self.no_leader_queue.append(msg)
 
         else:
-            response = self.client_msg(msg['src'], 'redirect', msg['MID'])
+            response = self.client_msg(msg[SRC], 'redirect', msg[MID])
             self.send(response)
 
-    # generate reply message
+    # get reply message
     def client_msg(self, src, type, mid):
         return {
-            'src': self.id,
-            'dst': src,
-            'leader': self.leader,
-            'type': type,
-            'MID': mid
+            SRC: self.id,
+            DST: src,
+            LEADER: self.leader,
+            TYPE: type,
+            MID: mid
         }
 
-    # start a election
+    # new leader election
     def elect_leader(self):
         self.term += 1
         self.state = CANDIDATE
@@ -185,26 +207,26 @@ class Replica:
         self.votes.append(self.id)
         print("Replica %s has started a new election" % self.id)
 
-        for id in self.others:
+        for other in self.others:
             msg = {
-                'src': self.id,
-                'dst': id,
-                'leader': self.leader,
-                'type': 'request_vote',
-                'term': self.term,
-                'candidate_id': self.id,
-                'last_log_index': len(self.log) - 1,
-                'last_log_term': self.log[-1]['term']
+                SRC: self.id,
+                DST: other,
+                LEADER: self.leader,
+                TYPE: 'request_vote',
+                TERM: self.term,
+                CANDIDATE_ID: self.id,
+                LAST_LOG_IDX: len(self.log) - 1,
+                LAST_LOG_TERM: self.log[-1][TERM]
             }
             # send election request for all the other servers
             self.send(msg)
 
     # handle request vote message
     def request_vote(self, msg):
-        if msg['term'] >= self.term and self.state != LEADER:
+        if msg[TERM] >= self.term and self.state != LEADER:
             self.state = FOLLOWER
-            self.term = msg['term']
-            self.leader = msg['leader']
+            self.term = msg[TERM]
+            self.leader = msg[LEADER]
             self.votes = []
             self.vote = None
 
@@ -213,15 +235,15 @@ class Replica:
             reject = self.construct_request(msg, 'reject_vote')
 
             # check if the term is most up to date
-            if msg['term'] < self.term:
+            if msg[TERM] < self.term:
                 self.send(reject)
-            elif not (self.vote is None or self.vote == msg['src']):
+            elif not (self.vote is None or self.vote == msg[SRC]):
                 self.send(reject)
             # check if the log is most up to date
-            elif len(self.log) - 1 > msg['last_log_index']:
+            elif len(self.log) - 1 > msg[LAST_LOG_IDX]:
                 self.send(reject)
             # if log is the same, check the last log term
-            elif self.log[-1]['term'] > msg['last_log_term']:
+            elif self.log[-1][TERM] > msg[LAST_LOG_TERM]:
                 self.send(reject)
             else:
                 self.send(grant)
@@ -229,11 +251,11 @@ class Replica:
     # construct a request
     def construct_request(self, msg, state):
         return {
-            'src': self.id,
-            'dst': msg['src'],
-            'leader': self.leader,
-            'type': state,
-            'term': self.term
+            SRC: self.id,
+            DST: msg[SRC],
+            LEADER: self.leader,
+            TYPE: state,
+            TERM: self.term
         }
 
     # grant the voting request
@@ -242,7 +264,7 @@ class Replica:
             return
 
         # if majority has agreed to vote, current server becomes the leader
-        if msg['src'] not in self.votes:
+        if msg[SRC] not in self.votes:
             self.votes.append(self.votes)
             if len(self.votes) >= (len(self.others) + 1) // 2 + 1:
                 print("New leader at replica %s" % self.id)
@@ -251,14 +273,14 @@ class Replica:
                 self.votes = []
                 self.next_indexes = {}
                 self.match_indexes = {}
-                for id in self.others:
-                    self.next_indexes[id] = len(self.log)
-                    self.match_indexes[id] = 0
+                for other in self.others:# update logs
+                    self.next_indexes[other] = len(self.log)
+                    self.match_indexes[other] = 0
 
-    # generate a reject message
-    def reject_vote(self, msg):
-        if self.state == CANDIDATE and msg['term'] >= self.term:
-            self.term = msg['term']
+    # get reject message
+    def reject_vote(self, msg): 
+        if self.state == CANDIDATE and msg[TERM] >= self.term:
+            self.term = msg[TERM]
             self.state = FOLLOWER
             self.votes = []
             self.vote = None
@@ -268,13 +290,13 @@ class Replica:
     def grant_append(self, msg):
         if self.state != LEADER:
             return
-        self.next_indexes[msg['src']] = msg['next_index']
-        self.match_indexes[msg['src']] = msg['next_index'] - 1
+        self.next_indexes[msg[SRC]] = msg[NEXT_IDX]
+        self.match_indexes[msg[SRC]] = msg[NEXT_IDX] - 1
 
         # check if the log of the match index is correct
         i = len(self.log) - 1
         while i >= 0:
-            if self.log[i]['term'] == self.term:
+            if self.log[i][TERM] == self.term:
                 count = 0
                 for server in self.match_indexes:
                     if self.match_indexes[server] >= i:
@@ -286,108 +308,104 @@ class Replica:
         # update the commit index
         if i > self.commited:
             self.commited = i
-            self.commit()
+            self.apply_commit()
 
-    # reject append entries rpc
     def reject_append(self, msg):
         if self.state != LEADER:
             return
 
-        # check if term is the same
-        if msg['term'] > self.term:
+        # ensure term is the same
+        if msg[TERM] > self.term:
             self.state = FOLLOWER
 
-        # check which has the longer log
-        if 'next_index' in msg:
-            self.next_indexes[msg['src']] = msg['next_index']
+        # then select the longest log
+        if NEXT_IDX in msg: 
+            self.next_indexes[msg[SRC]] = msg[NEXT_IDX]
         else:
-            self.next_indexes[msg['src']] = self.next_indexes[msg['src']] - 1
-        self.send_append_entries([msg['src']])
+            self.next_indexes[msg[SRC]] = self.next_indexes[msg[SRC]] - 1
+        self.send_append_entries([msg[SRC]])
 
     # received append entries rpc from the server, will update its state if is the first time hearing from the leader
     def append_entries(self, msg):
-        if msg['term'] >= self.term:
-            self.term = msg['term']
+        if msg[TERM] >= self.term:
+            self.term = msg[TERM]
             self.state = FOLLOWER
-            self.leader = msg['leader']
+            self.leader = msg[LEADER]
             self.vote = None
             self.votes = []
             for msg in self.no_leader_queue:
-                self.send(self.client_msg(msg['src'], 'redirect', msg['MID']))
+                self.send(self.client_msg(msg[SRC], 'redirect', msg[MID]))
             self.no_leader_queue = []
 
-        if self.state == FOLLOWER:
-
-            # reject message
-            reject = {
-                'src': self.id,
-                'dst': msg['src'],
-                'leader': self.leader,
-                'type': 'reject_append',
-                'term': self.term
+        if self.state == FOLLOWER: # do vote
+            rejection = {
+                SRC: self.id,
+                DST: msg[SRC],
+                LEADER: self.leader,
+                TYPE: 'reject_append',
+                TERM: self.term
             }
 
             # grant message
             grant = {
-                'src': self.id,
-                'dst': msg['src'],
-                'leader': self.leader,
-                'type': 'grant_append',
-                'term': self.term
+                SRC: self.id,
+                DST: msg[SRC],
+                LEADER: self.leader,
+                TYPE: 'grant_append',
+                TERM: self.term
             }
 
             # if term doesn't match, ask for an older log
-            if msg['term'] < self.term:
-                self.send(reject)
+            if msg[TERM] < self.term:
+                self.send(rejection)
                 return
 
             self.last_append = time.time()
-            prev_log_index = msg['prev_log_index']
-            prev_log_term = msg['prev_log_term']
+            prev_log_index = msg[PREV_LOG_IDX]
+            prev_log_term = msg[PREV_LOG_TERM]
 
             # if log index is not the one the server is looking for that can match with the leader
             # send a reject
             if len(self.log) - 1 < prev_log_index:
-                self.send(reject)
+                self.send(rejection)
                 return
 
             # check the log for the term, if not equals, reject
-            if prev_log_term != self.log[prev_log_index]['term']:
+            if prev_log_term != self.log[prev_log_index][TERM]:
                 for i in range(len(self.log)):
-                    if self.log[i]['term'] == self.log[prev_log_index]['term']:
-                        reject['next_index'] = i
+                    if self.log[i][TERM] == self.log[prev_log_index][TERM]:
+                        rejection[NEXT_IDX] = i
                         break
                 else:
-                    reject['next_index'] = len(self.log) - 1
-                self.send(reject)
+                    rejection[NEXT_IDX] = len(self.log) - 1
+                self.send(rejection)
                 return
 
-            # if everything matches, cut off the extra log and append the leader's log
-            new_entries = msg['entries']
-            self.log = self.log[: prev_log_index + 1]
-            self.log.extend(new_entries)
+            # if everything matches
+            new_entries = msg[ENTRIES]
+            self.log = self.log[: prev_log_index + 1] # dump the extra log
+            self.log.extend(new_entries) # append to leader's log
 
-            # update commit
-            commit = msg['commit']
+            commit = msg[COMMIT]
 
             if commit > self.commited:
                 self.commited = min(commit, len(self.log) - 1)
-            grant['next_index'] = len(self.log)
+            grant[NEXT_IDX] = len(self.log)
 
             # if there are no entries in the server, grand the append
-            if msg['entries'] != 0:
+            if msg[ENTRIES] != 0:
                 self.send(grant)
-            self.commit()
+            self.apply_commit()
 
     # check if a command can be executed, will be executed if majority agree
-    def commit(self):
+    def apply_commit(self):
         while self.last_committed < self.commited:
             self.last_committed += 1
-            key = self.log[self.last_committed]['key']
-            value = self.log[self.last_committed]['value']
+            key = self.log[self.last_committed][KEY]
+            value = self.log[self.last_committed][VALUE]
             self.database[key] = value
             if self.state == LEADER:
-                msg = self.client_msg(self.log[self.last_committed]['client'], 'ok', self.log[self.last_committed]['MID'])
+                msg = self.client_msg(self.log[self.last_committed][CLIENT], 'ok', self.log[self.last_committed][MID])
                 self.send(msg)
 
     # react to the append entries from other server
@@ -397,19 +415,19 @@ class Replica:
         for server in others:
             next_index = self.next_indexes[server]
             prev_log_index = next_index - 1
-            prev_term = self.log[prev_log_index]['term']
+            prev_term = self.log[prev_log_index][TERM]
             entries = self.log[next_index:]
 
             msg = {
-                'src': self.id,
-                'dst': server,
-                'type': 'append_entries',
-                'term': self.term,
-                'leader': self.leader,
-                'prev_log_index': prev_log_index,
-                'prev_log_term': prev_term,
-                'entries': entries,
-                'commit': self.commited
+                SRC: self.id,
+                DST: server,
+                TYPE: 'append_entries',
+                TERM: self.term,
+                LEADER: self.leader,
+                PREV_LOG_IDX: prev_log_index,
+                PREV_LOG_TERM: prev_term,
+                ENTRIES: entries,
+                COMMIT: self.commited
             }
 
             self.send(msg)
