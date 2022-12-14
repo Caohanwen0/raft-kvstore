@@ -5,6 +5,8 @@ import argparse, socket, time, json, select, struct, sys, math, os, random
 
 #################
 
+DEBUG = False
+
 BROADCAST = 'FFFF'
 ENCODING = 'utf-8'
 
@@ -18,21 +20,22 @@ DST = 'dst'
 ENTRIES = 'entries'
 KEY = 'key'
 VALUE = 'value'
-TERM = "term"
-TYPE = "type"
-COMMIT = "commit"
+TERM = 'term'
+TYPE = 'type'
+COMMIT = 'commit'
 CLIENT = 'client'
 MID = 'MID'
-PREV_LOG_IDX = "prev_log_idx"
-PREV_LOG_TERM = "prev_log_term"
-NEXT_IDX = "next_idx"
-LAST_LOG_IDX = "last_log_idx" #  = len(log) - 1
-LAST_LOG_TERM = "last_log_term" # = log[-1]
+PREV_LOG_IDX = 'prev_log_idx'
+PREV_LOG_TERM = 'prev_log_term'
+NEXT_IDX = 'next_idx'
+LAST_LOG_IDX = 'last_log_idx' #  = len(log) - 1
+LAST_LOG_TERM = 'last_log_term' # = log[-1]
 CANDIDATE_ID = 'candidate_id'
 
 # hyperparameters
 
 HEARTBEAT = 0.15 # in second
+FLUSH_TIME = 0.01 # in second
 #################
 
 class Replica:
@@ -42,34 +45,35 @@ class Replica:
         self.others = others
         self.leader = BROADCAST
 
+        self.majority = (len(self.others) + 1) // 2
+
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.socket.bind(('localhost', 0))
         self.socket.setblocking(False)
-        #current term the server is on
+        
         self.term = 0
         self.state = FOLLOWER
         self.log = [{TERM: 0}]
 
-        # who the current server has voted for
-        self.vote = None
-        # the votes the current server received
-        self.votes = []
+        self.my_vote = None
+        
+        self.my_votes = [] # previous votes 
         self.timeout = random.uniform(0.3, 0.4)
-        # commit index of the server
-        self.commited = 0
-        self.last_committed = 0
+
+        self.commited = 0 
+        self.last_committed = 0 # commit index of the server
         
         self.database = {}
         self.flush_time = time.time()
 
-        self.start_time = time.time()
-        self.last_heartbeat = time.time()
+        # time info
+        self.start_time = time.time() # starting time of this replica
+        self.last_heartbeat = time.time() # last time receiving heartbeat
         self.last_append = time.time()
         self.messages_timer = {}
         
         self.no_leader_queue = [] # queue for message caching when there's no leader
-
-        print("Replica %s starting up" % self.id, flush=True)
+        print("Replica %s starting up at %f:" % (self.id, self.start_time), flush=True)
         hello = { SRC: self.id, 
             DST: BROADCAST, 
             LEADER: BROADCAST, 
@@ -78,26 +82,34 @@ class Replica:
         self.send(hello)
         print("Sent hello message: %s" % hello, flush=True)
 
-    def send(self, message):
-        self.socket.sendto(json.dumps(message).encode(ENCODING), ('localhost', self.port))
+    def send(self, msg):
+        self.socket.sendto(json.dumps(msg).encode(ENCODING), ('localhost', self.port))
       
+    # generate reply message
+    def generate_msg(self, src, type, mid):
+        return {
+            SRC: self.id,
+            DST: src,
+            LEADER: self.leader,
+            TYPE: type,
+            MID: mid
+        }
+
     def recv_get(self, msg):
         if self.state == LEADER:
             key = msg[KEY]
-            response = self.client_msg(msg[SRC], 'ok', msg[MID])
+            response = self.generate_msg(msg[SRC], 'ok', msg[MID])
 
-            # if the key is in its store, go and grab the value
             if key in self.database:
                 response[VALUE] = self.database[key]
             else:
-                response[VALUE] = ''
+                response[VALUE] = '' # otherwise just return epsilon 
         # if self is not the leader, redirect to the leader
         elif self.leader != BROADCAST:
-            response = self.client_msg(msg[SRC], 'redirect', msg[MID])
+            response = self.generate_msg(msg[SRC], 'redirect', msg[MID])
 
-        # append the message to the queue if there is no leader now
-        elif self.leader == BROADCAST:
-            self.no_leader_queue.append(msg)
+        elif self.leader == BROADCAST:       # if leader is unknown
+            self.no_leader_queue.append(msg) # do broadcast
 
         self.send(response)
 
@@ -119,55 +131,71 @@ class Replica:
             elif msg[MID] not in self.messages_timer:
                 self.messages_timer[msg[MID]] = time.time()
 
-            self.log.append(
-                {TERM: self.term,
-                 KEY: msg[KEY],
-                 VALUE: msg[VALUE],
-                 CLIENT: msg[SRC],
-                 MID: msg[MID]})
-            if self.flush_time - time.time() >= 0.01:
+            self.log.append({TERM: self.term,
+                KEY: msg[KEY],
+                VALUE: msg[VALUE],
+                CLIENT: msg[SRC],
+                MID: msg[MID]
+                })
+            if self.flush_time - time.time() >= FLUSH_TIME:
                 self.send_append_entries(self.others)
                 self.flush_time = time.time()
 
-        # if self is the leader, append the request to the log
-        elif self.state == LEADER:
+        elif self.state == LEADER: # if self == leader
             self.buffer = 0
-            self.send_append_entries(self.others)
+            self.send_append_entries(self.others) # append the request to log
 
-        # if there is no leader, append the message to the queue
-        elif self.leader == BROADCAST:
-            self.no_leader_queue.append(msg)
+        elif self.leader == BROADCAST:# if leader is unknown,
+            self.no_leader_queue.append(msg) # append the message to the queue
 
-        else:
-            response = self.client_msg(msg[SRC], 'redirect', msg[MID])
+        else: # redirect to leader
+            response = self.generate_msg(msg[SRC], 'redirect', msg[MID])
             self.send(response)
 
-    # get reply message
-    def client_msg(self, src, type, mid):
-        return {
-            SRC: self.id,
-            DST: src,
-            LEADER: self.leader,
-            TYPE: type,
-            MID: mid
-        }
+    def request_vote(self, msg):
+        if msg[TERM] >= self.term and self.state != LEADER:
+            self.state = FOLLOWER
+            self.term = msg[TERM]
+            self.leader = msg[LEADER]
+            self.my_votes = []
+            self.my_vote = None
+
+        if self.state == FOLLOWER:
+            grant = self.construct_request(msg, 'grant_vote')
+            reject = self.construct_request(msg, 'reject_vote')
+
+            # check if the term is most up to date
+            if msg[TERM] < self.term:
+                self.send(reject)
+            elif not (self.my_vote is None or self.my_vote == msg[SRC]):
+                self.send(reject)
+            # check if the log is most up to date
+            elif len(self.log) - 1 > msg[LAST_LOG_IDX]:
+                self.send(reject)
+            # if log is the same, check the last log term
+            elif self.log[-1][TERM] > msg[LAST_LOG_TERM]:
+                self.send(reject)
+            else:
+                self.send(grant)
 
     # get reject message
     def reject_vote(self, msg): 
         if self.state == CANDIDATE and msg[TERM] >= self.term:
             self.term = msg[TERM]
             self.state = FOLLOWER
-            self.votes = []
-            self.vote = None
+            self.my_votes = []
+            self.my_vote = None
 
     # new leader election
     def elect_leader(self):
         self.term += 1
         self.state = CANDIDATE
-        self.vote = self.id
-        self.votes = []
-        self.votes.append(self.id)
-        print("Replica %s has started a new election" % self.id)
+        self.my_vote = self.id
+        self.my_votes = []
+        self.my_votes.append(self.id)
+        if DEBUG:
+            passed = time.time() - self.start_time
+            print("Replica %s has started a new election at %f:" % (self.id, passed))
 
         for other in self.others:
             msg = {
@@ -182,33 +210,6 @@ class Replica:
             }
             # send election request for all the other servers
             self.send(msg)
-
-    # handle request vote message
-    def request_vote(self, msg):
-        if msg[TERM] >= self.term and self.state != LEADER:
-            self.state = FOLLOWER
-            self.term = msg[TERM]
-            self.leader = msg[LEADER]
-            self.votes = []
-            self.vote = None
-
-        if self.state == FOLLOWER:
-            grant = self.construct_request(msg, 'grant_vote')
-            reject = self.construct_request(msg, 'reject_vote')
-
-            # check if the term is most up to date
-            if msg[TERM] < self.term:
-                self.send(reject)
-            elif not (self.vote is None or self.vote == msg[SRC]):
-                self.send(reject)
-            # check if the log is most up to date
-            elif len(self.log) - 1 > msg[LAST_LOG_IDX]:
-                self.send(reject)
-            # if log is the same, check the last log term
-            elif self.log[-1][TERM] > msg[LAST_LOG_TERM]:
-                self.send(reject)
-            else:
-                self.send(grant)
 
     # construct a request
     def construct_request(self, msg, state):
@@ -226,13 +227,15 @@ class Replica:
             return
 
         # if majority has agreed to vote, current server becomes the leader
-        if msg[SRC] not in self.votes:
-            self.votes.append(self.votes)
-            if len(self.votes) >= (len(self.others) + 1) // 2 + 1:
-                print("New leader at replica %s" % self.id)
+        if msg[SRC] not in self.my_votes:
+            self.my_votes.append(self.my_votes)
+            if len(self.my_votes) >= self.majority + 1:
+                if DEBUG:
+                    passed = time.time() - self.start_time
+                    print("Replica %s is selected as the new leader at %f:" % (self.id, passed))
                 self.state = LEADER
                 self.leader = self.id
-                self.votes = []
+                self.my_votes = []
                 self.next_indexes = {}
                 self.match_indexes = {}
                 for other in self.others:# update logs
@@ -240,7 +243,7 @@ class Replica:
                     self.match_indexes[other] = 0
             
     # grant the append entries rpc
-    def grant_append(self, msg):
+    def recv_grant_append(self, msg):
         if self.state != LEADER:
             return
         self.next_indexes[msg[SRC]] = msg[NEXT_IDX]
@@ -254,7 +257,7 @@ class Replica:
                 for server in self.match_indexes:
                     if self.match_indexes[server] >= i:
                         count += 1
-                if count >= ((len(self.others) + 1) // 2):
+                if count >= self.majority:
                     break
             i -= 1
 
@@ -263,13 +266,12 @@ class Replica:
             self.commited = i
             self.apply_commit()
 
-    def reject_append(self, msg):
+    def recv_reject_append(self, msg):
         if self.state != LEADER:
             return
 
-        # ensure term is the same
         if msg[TERM] > self.term:
-            self.state = FOLLOWER
+            self.state = FOLLOWER # ensure time is the same
 
         # then select the longest log
         if NEXT_IDX in msg: 
@@ -278,16 +280,17 @@ class Replica:
             self.next_indexes[msg[SRC]] = self.next_indexes[msg[SRC]] - 1
         self.send_append_entries([msg[SRC]])
 
-    # received append entries rpc from the server, will update its state if is the first time hearing from the leader
+
+    # handle append entries msg from the server
     def append_entries(self, msg):
-        if msg[TERM] >= self.term:
+        if msg[TERM] >= self.term: # if current replica has not updated about the new leader
             self.term = msg[TERM]
-            self.state = FOLLOWER
+            self.state = FOLLOWER # new leader is selected so now myself becomes the follower
             self.leader = msg[LEADER]
-            self.vote = None
-            self.votes = []
-            for msg in self.no_leader_queue:
-                self.send(self.client_msg(msg[SRC], 'redirect', msg[MID]))
+            self.my_vote = None
+            self.my_votes = []
+            for msg in self.no_leader_queue: # if I have received this message before the election finished
+                self.send(self.generate_msg(msg[SRC], 'redirect', msg[MID])) # send back
             self.no_leader_queue = []
 
         if self.state == FOLLOWER: # do vote
@@ -308,8 +311,7 @@ class Replica:
                 TERM: self.term
             }
 
-            # if term doesn't match, ask for an older log
-            if msg[TERM] < self.term:
+            if msg[TERM] < self.term: # term don't match locally
                 self.send(rejection)
                 return
 
@@ -350,7 +352,8 @@ class Replica:
                 self.send(grant)
             self.apply_commit()
 
-    # check if a command can be executed, will be executed if majority agree
+    # check if a command can be executed
+    # and execute it if more than majority of people agree
     def apply_commit(self):
         while self.last_committed < self.commited:
             self.last_committed += 1
@@ -358,7 +361,7 @@ class Replica:
             value = self.log[self.last_committed][VALUE]
             self.database[key] = value
             if self.state == LEADER:
-                msg = self.client_msg(self.log[self.last_committed][CLIENT], 'ok', self.log[self.last_committed][MID])
+                msg = self.generate_msg(self.log[self.last_committed][CLIENT], 'ok', self.log[self.last_committed][MID])
                 self.send(msg)
 
     # react to the append entries from other server
@@ -370,7 +373,6 @@ class Replica:
             prev_log_index = next_index - 1
             prev_term = self.log[prev_log_index][TERM]
             entries = self.log[next_index:]
-
             msg = {
                 SRC: self.id,
                 DST: server,
@@ -397,9 +399,9 @@ class Replica:
         elif type == 'append_entries':
             self.append_entries(msg)
         elif type == 'grant_append':
-            self.grant_append(msg)
+            self.recv_grant_append(msg)
         elif type == 'reject_append':
-            self.reject_append(msg)
+            self.recv_reject_append(msg)
         elif type == 'grant_vote':
             self.grant_vote(msg)
         elif type == 'reject_vote':
@@ -412,9 +414,11 @@ class Replica:
         while True:
             try:
                 current_time = time.time()
-                data, addr = self.socket.recvfrom(65535)
+                data, _ = self.socket.recvfrom(65535)
                 msg = data.decode(ENCODING)
-                print("Received message '%s'" % (msg,), flush=True)
+                if DEBUG:
+                    passed = time.time() - self.start_time
+                    print("Replica %s received message '%s' at %f:\n%s" % (self.id, msg, passed), flush=True)
             except BlockingIOError:
                 # if not receving heartbeat from the leader
                 if current_time - self.last_append >= self.timeout and self.state != LEADER:
@@ -429,7 +433,6 @@ class Replica:
             
             msg = json.loads(msg)
             self.handler(msg)
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='run a key-value store')
