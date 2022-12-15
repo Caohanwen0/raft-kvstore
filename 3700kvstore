@@ -53,7 +53,6 @@ class Replica:
         self.socket.setblocking(False)
         
         self.term = 0
-        self.highest_replicated_value = 0
         self.state = FOLLOWER
         self.log = [{TERM: 0}]
 
@@ -67,6 +66,8 @@ class Replica:
         
         self.database = {}
         self.flush_time = time.time()
+
+        self.cache = [] # Append the current append entries, as they get sent i remove them
 
         # time info
         self.start_time = time.time() # starting time of this replica
@@ -126,7 +127,6 @@ class Replica:
                     TYPE: 'fail',
                     MID: msg[MID]
                 }
-                print("HEERRRRRREEE")
 
                 self.send(response)
                 del self.messages_timer[msg[MID]]
@@ -388,56 +388,14 @@ class Replica:
                 ENTRIES: entries,
                 COMMIT: self.commited
             }
+            self.cache.append(msg)
             self.send(msg)
-    
-    def send_append_ack(self, others):
-        for server in others:
-            next_index = self.next_indexes[server]
-            prev_log_index = next_index - 1
-            prev_term = self.log[prev_log_index][TERM]
-            entries = self.log[next_index:]
-            curr_len = len(self.log)
-
-            msg = {
-                SRC: self.id,
-                DST: server,
-                TYPE: 'append_ack',
-                TERM: self.term,
-                LEADER: self.leader,
-                PREV_LOG_IDX: prev_log_index,
-                PREV_LOG_TERM: prev_term,
-                LOG_LENGTH: curr_len,
-            }
-            self.send(msg)
-
-    def update_highest_value(self, msg):
-        last_log_index = msg[LAST_LOG_IDX]
-        prev_log_index = msg[PREV_LOG_IDX]
-        largest_value = self.find_highest_value()
-        if last_log_index < prev_log_index:
-            # call th
-            # compare with the return log value
-            # update the log value if it is less than it
-            last_log_index = prev_log_index
-
-    
-    def find_highest_value(self):
-        values = collections.defaultdict(int)
-        largest_value = 0
-        largest_entry = ""
-        majority = (len(self.others) + 1) // 2
-        for log in self.log:
-            # find highest replicated entry which has been committed
-            curr_value = log['value']
-            values[curr_value] += 1
-            if values[curr_value] > largest_value:
-                largest_value = values[curr_value]
-                largest_entry = curr_value
-        #{'asdfasd': 5, 'fasdfsda': 2}
-        print(values)
-        print("HELLOOOO")
+            self.cache.pop()
         
-        return largest_value
+        while self.cache:
+            curr_msg = self.cache.pop()
+            self.send(curr_msg)
+    
         
         
     # entry for message handling
@@ -459,13 +417,6 @@ class Replica:
             self.grant_vote(msg)
         elif type == 'reject_vote':
             self.reject_vote(msg)
-        elif type == 'fail':
-            print("HIIIIIIII")
-            self.send_ack(msg)
-        elif type == 'append_ack':
-            # Update highest entry for that follower
-            self.update_highest_value(msg)
-    
     
     def run(self):
         self.last_heartbeat = time.time()
@@ -485,6 +436,14 @@ class Replica:
                     # then start election
                     # send a fail to everything 
                     print("HELLOOOO")
+                    # if some values are yet to committed into the list, replicas sent those values
+                    if self.cache:
+                        # commit those values, append the entries, 
+                        for msg in self.cache:
+                            self.send(msg)
+                        self.cache = []
+
+
                     self.elect_leader()
                     self.last_append = time.time()
         
