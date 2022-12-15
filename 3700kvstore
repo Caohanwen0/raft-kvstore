@@ -388,13 +388,10 @@ class Replica:
                 ENTRIES: entries,
                 COMMIT: self.commited
             }
+            # send each message and add it to the cache as we get it and pop as we send it
             self.cache.append(msg)
             self.send(msg)
             self.cache.pop()
-        
-        while self.cache:
-            curr_msg = self.cache.pop()
-            self.send(curr_msg)
     
         
         
@@ -433,12 +430,9 @@ class Replica:
             except BlockingIOError:
                 # if not receving heartbeat from the leader
                 if current_time - self.last_append >= self.timeout and self.state != LEADER:
-                    # then start election
-                    # send a fail to everything 
-                    print("HELLOOOO")
-                    # if some values are yet to committed into the list, replicas sent those values
+                    # check to see if there are value left to be commited if the previous leader failed
                     if self.cache:
-                        # commit those values, append the entries, 
+                        # commit those values, append the entries and empty out the cache
                         for msg in self.cache:
                             self.send(msg)
                         self.cache = []
